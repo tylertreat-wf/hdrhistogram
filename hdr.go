@@ -4,8 +4,16 @@
 package hdrhistogram
 
 import (
+	"bytes"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
+)
+
+const (
+	encodingHeaderSize int32 = 40
+	encodingCookieBase int32 = 0x1c849301
 )
 
 // A Bracket is a part of a cumulative distribution.
@@ -22,14 +30,17 @@ type Histogram struct {
 	highestTrackableValue       int64
 	unitMagnitude               int64
 	significantFigures          int64
-	subBucketHalfCountMagnitude int32
-	subBucketHalfCount          int32
+	subBucketHalfCountMagnitude uint32
+	subBucketHalfCount          uint32
 	subBucketMask               int64
 	subBucketCount              int32
 	bucketCount                 int32
 	countsLen                   int32
 	totalCount                  int64
 	counts                      []int64
+	wordSizeInBytes             int32
+	normalizingIndexOffset      int32
+	intToFloatRatio             float64
 }
 
 // New returns a new Histogram instance capable of tracking values in the given
@@ -44,7 +55,7 @@ func New(minValue, maxValue int64, sigfigs int) *Histogram {
 	// we need to shove these down to float32 or the math is wrong
 	a := float32(math.Log(float64(largestValueWithSingleUnitResolution)))
 	b := float32(math.Log(2))
-	subBucketCountMagnitude := int32(math.Ceil(float64(a / b)))
+	subBucketCountMagnitude := uint32(math.Ceil(float64(a / b)))
 
 	subBucketHalfCountMagnitude := subBucketCountMagnitude
 	if subBucketHalfCountMagnitude < 1 {
@@ -59,7 +70,7 @@ func New(minValue, maxValue int64, sigfigs int) *Histogram {
 
 	subBucketCount := int32(math.Pow(2, float64(subBucketHalfCountMagnitude)+1))
 
-	subBucketHalfCount := subBucketCount / 2
+	subBucketHalfCount := uint32(subBucketCount / 2)
 	subBucketMask := int64(subBucketCount-1) << uint(unitMagnitude)
 
 	// determine exponent range needed to support the trackable value with no
@@ -87,6 +98,8 @@ func New(minValue, maxValue int64, sigfigs int) *Histogram {
 		countsLen:                   countsLen,
 		totalCount:                  0,
 		counts:                      make([]int64, countsLen),
+		wordSizeInBytes:             8,
+		intToFloatRatio:             1.0,
 	}
 }
 
@@ -212,7 +225,7 @@ func (h *Histogram) RecordCorrectedValue(v, expectedInterval int64) error {
 // the value is out of range.
 func (h *Histogram) RecordValues(v, n int64) error {
 	idx := h.countsIndexFor(v)
-	if idx < 0 || int(h.countsLen) <= idx {
+	if idx < 0 || h.countsLen <= idx {
 		return fmt.Errorf("value %d is too large to be recorded", v)
 	}
 	h.counts[idx] += n
@@ -258,6 +271,154 @@ func (h *Histogram) CumulativeDistribution() []Bracket {
 	return result
 }
 
+func (h *Histogram) getNeededByteBufferCapacity(relevantLen int32) int32 {
+	return h.getNeededPayloadByteBufferCapacity(relevantLen) + encodingHeaderSize
+}
+
+func (h *Histogram) getNeededPayloadByteBufferCapacity(relevantLen int32) int32 {
+	return relevantLen * h.wordSizeInBytes
+}
+
+func (h *Histogram) getEncodingCookie() int32 {
+	return encodingCookieBase + (h.wordSizeInBytes << 4)
+}
+
+func getWordSizeInBytesFromCookie(cookie int32) int32 {
+	return (cookie & 0xf0) >> 4
+}
+
+func getCookieBase(cookie int32) int32 {
+	return cookie & ^0xf0
+}
+
+// EncodeIntoByteBuffer writes this Histogram into a bytes.Buffer. It returns
+// the number of bytes written to the buffer. This is NOT a threadsafe
+// operation.
+func (h *Histogram) EncodeIntoByteBuffer(buf bytes.Buffer) *bytes.Reader {
+	max := h.Max()
+	relevantLen := h.countsIndexFor(max) + 1
+	buf.Grow(int(h.getNeededByteBufferCapacity(relevantLen)))
+	binary.Write(&buf, binary.BigEndian, h.getEncodingCookie())
+	binary.Write(&buf, binary.BigEndian, relevantLen*h.wordSizeInBytes)
+	binary.Write(&buf, binary.BigEndian, h.normalizingIndexOffset)
+	binary.Write(&buf, binary.BigEndian, h.significantFigures)
+	binary.Write(&buf, binary.BigEndian, h.lowestTrackableValue)
+	binary.Write(&buf, binary.BigEndian, h.highestTrackableValue)
+	binary.Write(&buf, binary.BigEndian, h.intToFloatRatio)
+	for i := 0; i < int(relevantLen); i++ {
+		binary.Write(&buf, binary.BigEndian, h.counts[i])
+	}
+	return bytes.NewReader(buf.Bytes())
+}
+
+func DecodeFromByteBuffer(buf *bytes.Reader, minBarForHighestTrackableValue int64) (*Histogram, error) {
+	var (
+		cookie                 int32
+		payloadLen             int32
+		normalizingIndexOffset int32
+		significantFigures     int64
+		lowestTrackableValue   int64
+		highestTrackableValue  int64
+		intToFloatRatio        float64
+	)
+	if err := binary.Read(buf, binary.BigEndian, &cookie); err != nil {
+		println("cant read cookie")
+		return nil, err
+	}
+	switch getCookieBase(cookie) {
+	case encodingCookieBase:
+		if err := binary.Read(buf, binary.BigEndian, &payloadLen); err != nil {
+			println("cant read length")
+			return nil, err
+		}
+		if err := binary.Read(buf, binary.BigEndian, &normalizingIndexOffset); err != nil {
+			println("cant read index offset")
+			return nil, err
+		}
+		if err := binary.Read(buf, binary.BigEndian, &significantFigures); err != nil {
+			println("cant read sigfigs")
+			return nil, err
+		}
+		if err := binary.Read(buf, binary.BigEndian, &lowestTrackableValue); err != nil {
+			println("cant read min")
+			return nil, err
+		}
+		if err := binary.Read(buf, binary.BigEndian, &highestTrackableValue); err != nil {
+			println("cant read max")
+			return nil, err
+		}
+		if err := binary.Read(buf, binary.BigEndian, &intToFloatRatio); err != nil {
+			println("cant read ratio")
+			return nil, err
+		}
+	default:
+		return nil, errors.New("The buffer does not contain a Histogram")
+	}
+	if minBarForHighestTrackableValue > highestTrackableValue {
+		highestTrackableValue = minBarForHighestTrackableValue
+	}
+
+	h := New(lowestTrackableValue, highestTrackableValue, int(significantFigures))
+	h.intToFloatRatio = intToFloatRatio
+	h.normalizingIndexOffset = normalizingIndexOffset
+	if cookie != h.getEncodingCookie() {
+		return nil, errors.New("The buffer's encoded value byte size does not match the Histogram's")
+	}
+
+	expectedCapacity := payloadLen
+	if h.getNeededPayloadByteBufferCapacity(h.countsLen) < expectedCapacity {
+		expectedCapacity = h.getNeededPayloadByteBufferCapacity(h.countsLen)
+	}
+
+	if expectedCapacity > int32(buf.Len()) {
+		return nil, errors.New("The buffer does not contain the full Histogram payload")
+	}
+
+	h.fillCountsArrayFromBuffer(buf, expectedCapacity/getWordSizeInBytesFromCookie(cookie), getWordSizeInBytesFromCookie(cookie))
+	h.establishInternalTrackingValues()
+	return h, nil
+}
+
+func (h *Histogram) fillCountsArrayFromBuffer(buf *bytes.Reader, lengthInWords, wordSizeInBytes int32) error {
+	switch wordSizeInBytes {
+	case 8:
+		for i := int32(0); i < lengthInWords; i++ {
+			var v int64
+			binary.Read(buf, binary.BigEndian, &v)
+			h.counts[i] = v
+		}
+		break
+	default:
+		return errors.New("word size must be 8 bytes")
+	}
+	return nil
+}
+
+func (h *Histogram) establishInternalTrackingValues() {
+	h.highestTrackableValue = 0
+	h.lowestTrackableValue = math.MaxInt64
+	maxIndex := int32(-1)
+	minIndex := int32(-1)
+	observedTotalCount := int64(0)
+	for i := int32(0); i < h.countsLen; i++ {
+		countAtIndex := h.counts[i]
+		if countAtIndex > 0 {
+			observedTotalCount += countAtIndex
+			maxIndex = i
+			if minIndex == -1 && i != 0 {
+				minIndex = i
+			}
+		}
+	}
+	if maxIndex >= 0 {
+		h.highestTrackableValue = h.highestEquivalentValue(h.valueFromIndex2(uint32(maxIndex)))
+	}
+	if minIndex >= 0 {
+		h.lowestTrackableValue = h.valueFromIndex2(uint32(minIndex))
+	}
+	h.totalCount = observedTotalCount
+}
+
 func (h *Histogram) iterator() *iterator {
 	return &iterator{
 		h:            h,
@@ -294,6 +455,16 @@ func (h *Histogram) sizeOfEquivalentValueRange(v int64) int64 {
 	return int64(1) << uint(h.unitMagnitude+int64(adjustedBucket))
 }
 
+func (h *Histogram) valueFromIndex2(idx uint32) int64 {
+	bucketIdx := (idx >> h.subBucketHalfCountMagnitude) - 1
+	subBucketIndex := (idx & (h.subBucketHalfCount - 1)) + h.subBucketHalfCount
+	if bucketIdx < 0 {
+		subBucketIndex -= h.subBucketHalfCount
+		bucketIdx = 0
+	}
+	return h.valueFromIndex(int32(bucketIdx), int32(subBucketIndex))
+}
+
 func (h *Histogram) valueFromIndex(bucketIdx, subBucketIdx int32) int64 {
 	return int64(subBucketIdx) << uint(int64(bucketIdx)+h.unitMagnitude)
 }
@@ -322,7 +493,7 @@ func (h *Histogram) getCountAtIndex(bucketIdx, subBucketIdx int32) int64 {
 
 func (h *Histogram) countsIndex(bucketIdx, subBucketIdx int32) int32 {
 	bucketBaseIdx := (bucketIdx + 1) << uint(h.subBucketHalfCountMagnitude)
-	offsetInBucket := subBucketIdx - h.subBucketHalfCount
+	offsetInBucket := subBucketIdx - int32(h.subBucketHalfCount)
 	return bucketBaseIdx + offsetInBucket
 }
 
@@ -336,10 +507,10 @@ func (h *Histogram) getSubBucketIdx(v int64, idx int32) int32 {
 	return int32(v >> uint(int64(idx)+int64(h.unitMagnitude)))
 }
 
-func (h *Histogram) countsIndexFor(v int64) int {
+func (h *Histogram) countsIndexFor(v int64) int32 {
 	bucketIdx := h.getBucketIndex(v)
 	subBucketIdx := h.getSubBucketIdx(v, bucketIdx)
-	return int(h.countsIndex(bucketIdx, subBucketIdx))
+	return h.countsIndex(bucketIdx, subBucketIdx)
 }
 
 type iterator struct {
@@ -357,7 +528,7 @@ func (i *iterator) next() bool {
 	// increment bucket
 	i.subBucketIdx++
 	if i.subBucketIdx >= i.h.subBucketCount {
-		i.subBucketIdx = i.h.subBucketHalfCount
+		i.subBucketIdx = int32(i.h.subBucketHalfCount)
 		i.bucketIdx++
 	}
 
